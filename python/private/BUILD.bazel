@@ -829,6 +829,16 @@ py_binary(
     ],
 )
 
+# Used for py_executable rule
+# C++ wrapper for zipper to process Python zip manifests
+cc_binary(
+    name = "py_executable_zip_gen",
+    srcs = ["py_executable_zip_gen.cc"],
+    data = ["@bazel_tools//tools/zip:zipper"],
+    deps = ["@bazel_tools//tools/cpp/runfiles"],
+    visibility = ["//visibility:public"],
+)
+
 py_binary(
     name = "py_wheel_dist",
     srcs = ["py_wheel_dist.py"],
