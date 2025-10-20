@@ -14,21 +14,21 @@
 
 // Wrapper for zipper that processes Python zip manifest generation.
 //
-// This native C++ tool replaces the shell script wrapper, providing the same
-// simplified Starlark API while maintaining native performance. It eliminates
-// the need for to_list() calls in Starlark by processing file lists at
-// execution time.
+// This C++ script wraps `@bazel_tools//tools/zip/zipper` to eliminate
+// the need for `depset.to_list()` calls in Starlark by processing file lists at
+// execution time, and automatically generates `__init__.py` files for all
+// directories containing Python files (replicating Bazel's EmptyFilesSupplier).
 //
-// Performance characteristics:
-// - Zero per-target overhead vs direct zipper usage (within measurement noise)
-// - One-time compilation cost (~1-2s per workspace)
-// - Uses std::filesystem for robust path manipulation (C++17)
+// Usage: py_executable_zip_gen [flags...] <input_files_manifest>
+//   Flags are passed as regular command-line arguments
+//   Input files manifest contains the list of files to include (short_path=disk_path)
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -37,22 +37,19 @@
 using bazel::tools::cpp::runfiles::Runfiles;
 namespace fs = std::filesystem;
 
-// Path manipulation utilities using std::filesystem (C++17)
+// Path manipulation utilities
 namespace path {
 
 // Normalize a path (remove "../" and "." components)
-// Uses std::filesystem::path::lexically_normal() for correctness
 std::string normalize(const std::string& p) {
   return fs::path(p).lexically_normal().string();
 }
 
 // Remove prefix from path
 std::string relativize(const std::string& path, const std::string& prefix) {
-  // Check if path starts with prefix
   if (path.size() >= prefix.size() && 
       path.compare(0, prefix.size(), prefix) == 0) {
     size_t start = prefix.size();
-    // Skip leading slash if present
     if (start < path.size() && path[start] == '/') {
       start++;
     }
@@ -68,30 +65,11 @@ bool starts_with(const std::string& str, const std::string& prefix) {
 
 } // namespace path
 
-// Get zip runfiles path for a file
-std::string get_zip_runfiles_path(const std::string& path,
-                                   const std::string& workspace_name,
-                                   bool legacy_external_runfiles) {
-  std::string zip_runfiles_path;
-  
-  if (legacy_external_runfiles && path::starts_with(path, "external/")) {
-    // Remove "external/" prefix
-    zip_runfiles_path = path::relativize(path, "external");
-  } else {
-    // Normalize workspace_name/path
-    std::string combined = workspace_name + "/" + path;
-    zip_runfiles_path = path::normalize(combined);
-  }
-  
-  return "runfiles/" + zip_runfiles_path;
-}
-
-// Parse a file entry in "short_path=disk_path" or "short_path=" format
 struct FileEntry {
   std::string short_path;
   std::string disk_path;
-  bool is_empty;
-  
+
+  // Parse a file entry in "short_path=disk_path" format
   static FileEntry parse(const std::string& line) {
     FileEntry entry;
     size_t eq = line.find('=');
@@ -102,151 +80,273 @@ struct FileEntry {
     
     entry.short_path = line.substr(0, eq);
     entry.disk_path = line.substr(eq + 1);
-    entry.is_empty = entry.disk_path.empty();
     
     return entry;
   }
 };
 
-int main(int argc, char* argv[]) {
-  if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " <params_file>" << std::endl;
-    return 1;
+// Get path inside the zip where a file should go
+std::string get_zip_runfiles_path(const std::string& path,
+                                   const std::string& workspace_name,
+                                   bool legacy_external_runfiles) {
+  std::string zip_runfiles_path;
+  
+  if (legacy_external_runfiles && path::starts_with(path, "external/")) {
+    zip_runfiles_path = path::relativize(path, "external");
+  } else {
+    // Normalize workspace_name/../external/path to external/path
+    std::string combined = workspace_name + "/" + path;
+    zip_runfiles_path = path::normalize(combined);
   }
   
-  std::string params_file = argv[1];
+  return "runfiles/" + zip_runfiles_path;
+}
+
+// Replicates the logic of Bazel's EmptyFilesSupplier Java class, which
+// automatically generates empty __init__.py files for all directories containing
+// Python source files or shared libraries, and all their parent directories
+// (excluding the repo root).
+//
+// This eliminates the expensive depset flattening that occurred during analysis
+// time when accessing runfiles.empty_filenames in Starlark.
+//
+// Original Java implementation:
+// https://github.com/bazelbuild/bazel/blob/ef47f25ed91c581838f663c6c116bf04d75441b4/src/main/java/com/google/devtools/build/lib/rules/python/PythonUtils.java#L52
+namespace empty_init_files {
+
+// Check if a path is a Python file (.py, .pyc, .so, .pyd)
+bool is_python_file(const std::string& path) {
+  if (path.empty()) return false;
   
-  // Parse arguments from params file
+  // Check for Python file extensions
+  if (path.size() >= 3 && path.substr(path.size() - 3) == ".py") return true;
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".pyc") return true;
+  if (path.size() >= 3 && path.substr(path.size() - 3) == ".so") return true;
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".pyd") return true;
+  
+  return false;
+}
+
+// Extract directory path from a file path
+std::string get_directory(const std::string& path) {
+  size_t last_slash = path.find_last_of('/');
+  if (last_slash == std::string::npos) {
+    return "";
+  }
+  return path.substr(0, last_slash);
+}
+
+// Generate all parent directories (excluding root)
+std::vector<std::string> get_parent_directories(const std::string& dir) {
+  std::vector<std::string> parents;
+  std::string current = dir;
+  
+  while (!current.empty()) {
+    parents.push_back(current);
+    size_t last_slash = current.find_last_of('/');
+    if (last_slash == std::string::npos) {
+      break;
+    }
+    current = current.substr(0, last_slash);
+  }
+  
+  return parents;
+}
+
+// Collect all directories that need __init__.py files
+std::set<std::string> collect_init_directories(const std::vector<FileEntry>& files) {
+  std::set<std::string> init_dirs;
+  std::set<std::string> existing_init_files;
+  
+  // First, collect all directories containing existing __init__.py files
+  for (const auto& file : files) {
+    if (file.short_path.size() >= 12 && 
+        file.short_path.substr(file.short_path.size() - 12) == "/__init__.py") {
+      std::string dir = file.short_path.substr(0, file.short_path.size() - 12);
+      existing_init_files.insert(dir);
+    }
+  }
+  
+  for (const auto& file : files) {
+    if (is_python_file(file.short_path)) {
+      std::string dir = get_directory(file.short_path);
+      if (!dir.empty()) {
+        for (const auto& parent : get_parent_directories(dir)) {
+          if (existing_init_files.find(parent) == existing_init_files.end()) {
+            init_dirs.insert(parent);
+          }
+        }
+      }
+    }
+  }
+  
+  return init_dirs;
+}
+
+} // namespace empty_init_files
+
+struct Config {
   std::string output;
   std::string workspace_name;
   std::string main_file;
   std::string repo_mapping_manifest;
   bool legacy_external_runfiles = false;
-  std::vector<FileEntry> files;
+  std::string input_files_manifest;
+};
+
+Config parse_args(int argc, char* argv[]) {
+  if (argc < 2) {
+    std::cerr << "Usage: " << argv[0] << " [flags...] <input_files_manifest>" << std::endl;
+    std::exit(1);
+  }
   
-  std::ifstream in(params_file);
+  Config config;
+  
+  for (int i = 1; i < argc; i++) {
+    std::string arg = argv[i];
+    
+    if (arg == "--output") {
+      if (i + 1 >= argc) {
+        std::cerr << "ERROR: --output requires a value" << std::endl;
+        std::exit(1);
+      }
+      config.output = argv[++i];
+    } else if (arg == "--workspace-name") {
+      if (i + 1 >= argc) {
+        std::cerr << "ERROR: --workspace-name requires a value" << std::endl;
+        std::exit(1);
+      }
+      config.workspace_name = argv[++i];
+    } else if (arg == "--main-file") {
+      if (i + 1 >= argc) {
+        std::cerr << "ERROR: --main-file requires a value" << std::endl;
+        std::exit(1);
+      }
+      config.main_file = argv[++i];
+    } else if (arg == "--repo-mapping-manifest") {
+      if (i + 1 >= argc) {
+        std::cerr << "ERROR: --repo-mapping-manifest requires a value" << std::endl;
+        std::exit(1);
+      }
+      config.repo_mapping_manifest = argv[++i];
+    } else if (arg == "--legacy-external-runfiles") {
+      config.legacy_external_runfiles = true;
+    } else {
+      config.input_files_manifest = arg;
+    }
+  }
+  
+  return config;
+}
+
+std::vector<FileEntry> read_input_manifest(const std::string& manifest_path) {
+  std::vector<FileEntry> files;
+  std::ifstream in(manifest_path);
+  
   if (!in) {
-    std::cerr << "ERROR: Cannot open params file: " << params_file << std::endl;
-    return 1;
+    std::cerr << "ERROR: Cannot open input files manifest: " << manifest_path << std::endl;
+    std::exit(1);
   }
   
   std::string line;
-  bool parsing_positional = false;
-  
   while (std::getline(in, line)) {
-    // Skip empty lines
-    if (line.empty()) continue;
-    
-    // Check for explicit -- separator
-    if (line == "--") {
-      parsing_positional = true;
-      continue;
-    }
-    
-    // If we've seen --, everything is a positional argument
-    if (parsing_positional) {
-      files.push_back(FileEntry::parse(line));
-      continue;
-    }
-    
-    // Parse flags
-    if (line == "--output") {
-      if (!std::getline(in, output)) {
-        std::cerr << "ERROR: --output requires a value" << std::endl;
-        return 1;
-      }
-    } else if (line == "--workspace-name") {
-      if (!std::getline(in, workspace_name)) {
-        std::cerr << "ERROR: --workspace-name requires a value" << std::endl;
-        return 1;
-      }
-    } else if (line == "--main-file") {
-      if (!std::getline(in, main_file)) {
-        std::cerr << "ERROR: --main-file requires a value" << std::endl;
-        return 1;
-      }
-    } else if (line == "--repo-mapping-manifest") {
-      if (!std::getline(in, repo_mapping_manifest)) {
-        std::cerr << "ERROR: --repo-mapping-manifest requires a value" << std::endl;
-        return 1;
-      }
-    } else if (line == "--legacy-external-runfiles") {
-      legacy_external_runfiles = true;
-    } else {
-      // Positional argument (file entry)
+    if (!line.empty()) {
       files.push_back(FileEntry::parse(line));
     }
   }
   
-  in.close();
-  
-  // Validate required arguments
-  if (output.empty()) {
+  return files;
+}
+
+void validate_config(const Config& config) {
+  if (config.input_files_manifest.empty()) {
+    std::cerr << "ERROR: No input files manifest specified" << std::endl;
+    std::exit(1);
+  }
+  if (config.output.empty()) {
     std::cerr << "ERROR: --output is required" << std::endl;
-    return 1;
+    std::exit(1);
   }
-  if (workspace_name.empty()) {
+  if (config.workspace_name.empty()) {
     std::cerr << "ERROR: --workspace-name is required" << std::endl;
-    return 1;
+    std::exit(1);
   }
-  if (main_file.empty()) {
+  if (config.main_file.empty()) {
     std::cerr << "ERROR: --main-file is required" << std::endl;
-    return 1;
+    std::exit(1);
   }
-  
-  // Generate zip manifest
-  // Order must match main branch for reproducible builds
-  std::string manifest_file = "zip_manifest.txt";
-  std::ofstream manifest(manifest_file);
+}
+
+void write_zip_manifest(const Config& config,
+                        const std::vector<FileEntry>& files,
+                        const std::set<std::string>& init_dirs,
+                        const std::string& manifest_path) {
+  std::ofstream manifest(manifest_path);
   if (!manifest) {
-    std::cerr << "ERROR: Cannot create manifest file: " << manifest_file << std::endl;
-    return 1;
+    std::cerr << "ERROR: Cannot create manifest file: " << manifest_path << std::endl;
+    std::exit(1);
+  }
+
+  manifest << "__main__.py=" << config.main_file << "\n";
+
+  manifest << "__init__.py=\n";
+  manifest << get_zip_runfiles_path("__init__.py", config.workspace_name, 
+                                     config.legacy_external_runfiles) << "=\n";
+
+  for (const auto& dir : init_dirs) {
+    std::string init_path = dir + "/__init__.py";
+    std::string zip_path = get_zip_runfiles_path(init_path, config.workspace_name, 
+                                                   config.legacy_external_runfiles);
+    manifest << zip_path << "=\n";
   }
   
-  // 1. Main file
-  manifest << "__main__.py=" << main_file << "\n";
-  
-  // 2. Default empty files
-  manifest << "__init__.py=\n";
-  manifest << get_zip_runfiles_path("__init__.py", workspace_name, legacy_external_runfiles) << "=\n";
-  
-  // 3. Process file entries
   for (const auto& file : files) {
-    std::string zip_path = get_zip_runfiles_path(file.short_path, workspace_name, legacy_external_runfiles);
+    std::string zip_path = get_zip_runfiles_path(file.short_path, config.workspace_name, 
+                                                   config.legacy_external_runfiles);
     manifest << zip_path << "=" << file.disk_path << "\n";
   }
   
-  // 4. Repo mapping manifest (last, to match main branch order)
-  if (!repo_mapping_manifest.empty()) {
-    manifest << "runfiles/_repo_mapping=" << repo_mapping_manifest << "\n";
+  if (!config.repo_mapping_manifest.empty()) {
+    manifest << "runfiles/_repo_mapping=" << config.repo_mapping_manifest << "\n";
   }
-  
-  manifest.close();
-  
-  // Find zipper tool via runfiles library
+}
+
+void run_zipper(const std::string& executable, 
+                const std::string& output,
+                const std::string& manifest_path) {
   std::string error;
-  std::unique_ptr<Runfiles> runfiles(Runfiles::Create(argv[0], &error));
+  std::unique_ptr<Runfiles> runfiles(Runfiles::Create(executable, &error));
   
   if (runfiles == nullptr) {
     std::cerr << "ERROR: Failed to initialize runfiles: " << error << std::endl;
-    return 1;
+    std::exit(1);
   }
   
   std::string zipper_path = runfiles->Rlocation("bazel_tools/tools/zip/zipper/zipper");
   if (zipper_path.empty()) {
     std::cerr << "ERROR: Could not locate zipper in runfiles" << std::endl;
-    return 1;
+    std::exit(1);
   }
   
-  // Execute zipper
-  std::string cmd = zipper_path + " cC " + output + " @" + manifest_file;
+  std::string cmd = zipper_path + " cC " + output + " @" + manifest_path;
   int result = std::system(cmd.c_str());
   
   if (result != 0) {
     std::cerr << "ERROR: zipper failed with exit code " << result << std::endl;
-    return 1;
+    std::exit(1);
   }
+}
+
+int main(int argc, char* argv[]) {
+  Config config = parse_args(argc, argv);
+  validate_config(config);
+  
+  std::vector<FileEntry> files = read_input_manifest(config.input_files_manifest);
+  std::set<std::string> init_dirs = empty_init_files::collect_init_directories(files);
+  
+  std::string zip_manifest_path = "zip_manifest.txt";
+  write_zip_manifest(config, files, init_dirs, zip_manifest_path);
+  run_zipper(argv[0], config.output, zip_manifest_path);
   
   return 0;
 }
-

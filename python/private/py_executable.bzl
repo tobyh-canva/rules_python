@@ -809,9 +809,6 @@ def _create_zip_file(ctx, *, output, zip_main, runfiles):
     legacy_external_runfiles = _py_builtins.get_legacy_external_runfiles(ctx)
 
     args = ctx.actions.args()
-    args.use_param_file("%s", use_always=True)
-    args.set_param_file_format("multiline")
-
     args.add("--output", output.path)
     args.add("--workspace-name", ctx.workspace_name)
     args.add("--main-file", zip_main.path)
@@ -832,22 +829,20 @@ def _create_zip_file(ctx, *, output, zip_main, runfiles):
         args.add("--repo-mapping-manifest", zip_repo_mapping_manifest.path)
         inputs.append(zip_repo_mapping_manifest)
 
-    args.add_all(runfiles.empty_filenames, map_each=_get_zip_empty_path_arg)
-    args.add_all(runfiles.files, map_each=_get_zip_path_arg)
+    manifest = ctx.actions.args()
+    manifest.use_param_file("%s", use_always=True)
+    manifest.set_param_file_format("multiline")
+    manifest.add_all(runfiles.files, map_each=_get_zip_path_arg)
 
     ctx.actions.run(
         executable = ctx.executable._zipper,
-        arguments = [args],
+        arguments = [args, manifest],
         inputs = depset(inputs, transitive=[runfiles.files]),
         outputs = [output],
         use_default_shell_env = True,
         mnemonic = "PythonZipper",
         progress_message = "Building Python zip: %{label}",
     )
-
-
-def _get_zip_empty_path_arg(file):
-    return "{}=".format(file.short_path)
 
 
 def _get_zip_path_arg(file):
