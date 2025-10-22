@@ -842,9 +842,6 @@ def _create_zip_file(ctx, *, output, zip_main, runfiles):
         progress_message = "Building Python zip: %{label}",
     )
 
-def _get_zip_empty_path_arg(file):
-    return "{}=".format(file.short_path)
-
 def _get_zip_path_arg(file):
     return "{}={}".format(file.short_path, file.path)
 

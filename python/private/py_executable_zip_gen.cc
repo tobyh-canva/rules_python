@@ -102,6 +102,89 @@ std::string get_zip_runfiles_path(const std::string& path,
   return "runfiles/" + zip_runfiles_path;
 }
 
+// Replicates the logic of Bazel's EmptyFilesSupplier Java class, which
+// automatically generates empty __init__.py files for all directories containing
+// Python source files or shared libraries, and all their parent directories
+// (excluding the repo root).
+//
+// This eliminates the expensive depset flattening that occurred during analysis
+// time when accessing runfiles.empty_filenames in Starlark.
+//
+// Original Java implementation:
+// https://github.com/bazelbuild/bazel/blob/ef47f25ed91c581838f663c6c116bf04d75441b4/src/main/java/com/google/devtools/build/lib/rules/python/PythonUtils.java#L52
+namespace empty_init_files {
+
+// Check if a path is a Python file (.py, .pyc, .so, .pyd)
+bool is_python_file(const std::string& path) {
+  if (path.empty()) return false;
+  
+  // Check for Python file extensions
+  if (path.size() >= 3 && path.substr(path.size() - 3) == ".py") return true;
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".pyc") return true;
+  if (path.size() >= 3 && path.substr(path.size() - 3) == ".so") return true;
+  if (path.size() >= 4 && path.substr(path.size() - 4) == ".pyd") return true;
+  
+  return false;
+}
+
+// Extract directory path from a file path
+std::string get_directory(const std::string& path) {
+  size_t last_slash = path.find_last_of('/');
+  if (last_slash == std::string::npos) {
+    return "";
+  }
+  return path.substr(0, last_slash);
+}
+
+// Generate all parent directories (excluding root)
+std::vector<std::string> get_parent_directories(const std::string& dir) {
+  std::vector<std::string> parents;
+  std::string current = dir;
+  
+  while (!current.empty()) {
+    parents.push_back(current);
+    size_t last_slash = current.find_last_of('/');
+    if (last_slash == std::string::npos) {
+      break;
+    }
+    current = current.substr(0, last_slash);
+  }
+  
+  return parents;
+}
+
+// Collect all directories that need __init__.py files
+std::set<std::string> collect_init_directories(const std::vector<FileEntry>& files) {
+  std::set<std::string> init_dirs;
+  std::set<std::string> existing_init_files;
+  
+  // First, collect all directories containing existing __init__.py files
+  for (const auto& file : files) {
+    if (file.short_path.size() >= 12 && 
+        file.short_path.substr(file.short_path.size() - 12) == "/__init__.py") {
+      std::string dir = file.short_path.substr(0, file.short_path.size() - 12);
+      existing_init_files.insert(dir);
+    }
+  }
+  
+  for (const auto& file : files) {
+    if (is_python_file(file.short_path)) {
+      std::string dir = get_directory(file.short_path);
+      if (!dir.empty()) {
+        for (const auto& parent : get_parent_directories(dir)) {
+          if (existing_init_files.find(parent) == existing_init_files.end()) {
+            init_dirs.insert(parent);
+          }
+        }
+      }
+    }
+  }
+  
+  return init_dirs;
+}
+
+} // namespace empty_init_files
+
 struct Config {
   std::string output;
   std::string workspace_name;
@@ -196,6 +279,7 @@ void validate_config(const Config& config) {
 
 void write_zip_manifest(const Config& config,
                         const std::vector<FileEntry>& files,
+                        const std::set<std::string>& init_dirs,
                         const std::string& manifest_path) {
   std::ofstream manifest(manifest_path);
   if (!manifest) {
@@ -209,6 +293,13 @@ void write_zip_manifest(const Config& config,
   manifest << get_zip_runfiles_path("__init__.py", config.workspace_name, 
                                      config.legacy_external_runfiles) << "=\n";
 
+  for (const auto& dir : init_dirs) {
+    std::string init_path = dir + "/__init__.py";
+    std::string zip_path = get_zip_runfiles_path(init_path, config.workspace_name, 
+                                                   config.legacy_external_runfiles);
+    manifest << zip_path << "=\n";
+  }
+  
   for (const auto& file : files) {
     std::string zip_path = get_zip_runfiles_path(file.short_path, config.workspace_name, 
                                                    config.legacy_external_runfiles);
@@ -251,9 +342,10 @@ int main(int argc, char* argv[]) {
   validate_config(config);
 
   std::vector<FileEntry> files = read_input_manifest(config.input_files_manifest);
+  std::set<std::string> init_dirs = empty_init_files::collect_init_directories(files);
   
   std::string zip_manifest_path = "zip_manifest.txt";
-  write_zip_manifest(config, files, zip_manifest_path);
+  write_zip_manifest(config, files, init_dirs, zip_manifest_path);
   run_zipper(argv[0], config.output, zip_manifest_path);
   
   return 0;
