@@ -1,0 +1,17 @@
+load("@bazel_lib//lib:write_source_files.bzl", "write_source_files")
+load("//python:py_binary.bzl", "py_binary")
+
+py_binary(
+    name = "generate_manifest",
+    srcs = ["generate_manifest.py"],
+    main = "generate_manifest.py",
+    visibility = [":__subpackages__"],
+)
+
+write_source_files(
+    name = "write_zipapp_snapshots",
+    additional_update_targets = [
+        "//tests/bootstrap_impls/zipapp_snapshots/with_create_init:write_manifest_snapshot",
+        "//tests/bootstrap_impls/zipapp_snapshots/without_create_init:write_manifest_snapshot",
+    ],
+)

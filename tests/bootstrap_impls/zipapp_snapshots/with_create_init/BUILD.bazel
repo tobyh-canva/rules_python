@@ -1,0 +1,31 @@
+load("@bazel_lib//lib:write_source_files.bzl", "write_source_file")
+load("//tests/support:py_reconfig.bzl", "py_reconfig_binary")
+load("//tests/bootstrap_impls/zipapp_snapshots:zipapp_snapshot.bzl", "zipapp_snapshot")
+
+py_reconfig_binary(
+    name = "with_create_init_bin",
+    srcs = ["bin.py"],
+    main = "bin.py",
+    deps = [
+        "@pypi_alpha//more_itertools",
+        "//python/runfiles",
+    ],
+    bootstrap_impl = "script",
+    # Force it to not be self-executable
+    build_python_zip = False,
+    # Create empty init files for all directories containing Python source files or shared libraries
+    legacy_create_init = True,
+)
+
+zipapp_snapshot(
+    name = "with_create_init",
+    py_binary_target = ":with_create_init_bin",
+)
+
+write_source_file(
+    name = "write_manifest_snapshot",
+    in_file = ":with_create_init",
+    out_file = "manifest_snapshot.txt",
+    visibility = ["//tests/bootstrap_impls/zipapp_snapshots:__subpackages__"],
+    suggested_update_target = "//tests/bootstrap_impls/zipapp_snapshots:write_zipapp_snapshots",
+)
